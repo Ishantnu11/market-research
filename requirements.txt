@@ -8,3 +8,4 @@ langchain-community
 langgraph
 tavily-python
 pydantic
+aiofiles

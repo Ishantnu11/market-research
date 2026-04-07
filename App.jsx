@@ -13,6 +13,10 @@ export default function App() {
   const [report, setReport] = useState("");
   const [error, setError] = useState("");
   const esRef = useRef(null);
+  
+  // Use relative path if backend is serving the frontend, 
+  // or use environment variable for cross-domain deployment.
+  const API_BASE = import.meta.env.VITE_API_BASE_URL || "";
 
   const addEvent = (type, data) =>
     setEvents((prev) => [...prev, { type, data, ts: Date.now() }]);
@@ -23,7 +27,7 @@ export default function App() {
     setReport("");
     setError("");
 
-    const res = await fetch("http://localhost:8001/research/stream", {
+    const res = await fetch(`${API_BASE}/research/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query }),
@@ -85,7 +89,7 @@ export default function App() {
   };
 
   const submitHITL = async (choice, competitors) => {
-    await fetch("http://localhost:8001/research/hitl-respond", {
+    await fetch(`${API_BASE}/research/hitl-respond`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: sessionId, choice, competitors }),

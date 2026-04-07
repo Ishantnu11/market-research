@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 try:
@@ -32,7 +33,7 @@ app = FastAPI(title="Market Research Agent API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["*"], # Allow all origins for the public version
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -511,3 +512,7 @@ async def hitl_respond(resp: HITLResponse):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+# Serve the React frontend (must be LAST to avoid route conflict)
+if os.path.exists("dist"):
+    app.mount("/", StaticFiles(directory="dist", html=True), name="static")
