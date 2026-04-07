@@ -1,9 +1,9 @@
 # Stage 1: Build the React frontend
-FROM node:20-slim AS frontend-builder
+FROM node:20 AS frontend-builder
 WORKDIR /app
 COPY package*.json ./
-# Use clean install for reliability
-RUN npm ci || npm install
+# Fresh install to ensure native binaries and permissions
+RUN npm ci
 COPY . .
 RUN npm run build
 
