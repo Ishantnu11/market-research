@@ -96,15 +96,20 @@ class GeminiClient:
         if not genai:
             raise RuntimeError("google-generativeai is not installed. Install it with: pip install google-generativeai")
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
-        # Use model parameter if provided, then env var, then default to gemini-pro
-        self.model_name = model or os.getenv("GEMINI_MODEL", "gemini-pro")
+        # Use model parameter if provided, then env var, then default to gemini-1.5-flash
+        self.model_name = model or os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        
+        # Ensure model name has the "models/" prefix for better compatibility
+        if not self.model_name.startswith("models/"):
+            self.model_name = f"models/{self.model_name}"
+            
         self.temperature = temperature
         genai.configure(api_key=self.api_key)
-        # Try to create the model; if it fails, fallback to gemini-pro
+        # Try to create the model; if it fails, fallback to gemini-1.5-flash
         try:
             self.client = genai.GenerativeModel(self.model_name)
         except Exception:
-            self.client = genai.GenerativeModel("gemini-pro")
+            self.client = genai.GenerativeModel("models/gemini-1.5-flash")
 
     def invoke(self, prompt):
         response = self.client.generate_content(
