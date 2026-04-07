@@ -3,7 +3,7 @@ uvicorn
 pydantic
 python-dotenv
 aiofiles
-google-generativeai
+google-genai
 langchain-groq
 langchain-tavily
 langgraph
