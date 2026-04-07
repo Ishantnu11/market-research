@@ -7,13 +7,16 @@ COPY . .
 RUN npm run build
 
 # Stage 2: Serve with FastAPI
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 WORKDIR /app
 
-# Install system dependencies if needed
+# Set non-interactive for apt-get
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    && rm -rf /var/lib/apt/cache/*
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install
 COPY requirements.txt .
