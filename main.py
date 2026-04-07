@@ -6,6 +6,8 @@ Phase 1 (Agents) + Phase 2 (FastAPI + SSE)
 import os
 import json
 import asyncio
+import queue
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import TypedDict, Literal, AsyncIterator
 from dotenv import load_dotenv
@@ -14,7 +16,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import openai
+
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 from langchain_groq import ChatGroq
 from langchain_tavily import TavilySearch
@@ -47,7 +53,9 @@ class ResearchState(TypedDict):
     report: str
     revision_count: int
     messages: list[str]
-    stream_queue: object        # asyncio.Queue — used to push SSE events
+    stream_queue: object        # asyncio.Queue
+    hitl_queue: object          # queue.Queue — thread-safe response bridge
+    loop: object                # asyncio event loop
 
 
 # ─────────────────────────────────────────
@@ -56,61 +64,84 @@ class ResearchState(TypedDict):
 
 class OpenAIClient:
     def __init__(self, model, api_key=None, temperature=0.3, api_base=None, api_type=None, api_version=None):
-        if api_key:
-            openai.api_key = api_key
+        import openai as openai_lib
+        openai_lib.api_key = api_key
         if api_base:
-            openai.api_base = api_base
-        elif os.getenv("OPENAI_API_BASE"):
-            openai.api_base = os.getenv("OPENAI_API_BASE")
+            openai_lib.api_base = api_base
         if api_type:
-            openai.api_type = api_type
-        elif os.getenv("OPENAI_API_TYPE"):
-            openai.api_type = os.getenv("OPENAI_API_TYPE")
+            openai_lib.api_type = api_type
         if api_version:
-            openai.api_version = api_version
-        elif os.getenv("OPENAI_API_VERSION"):
-            openai.api_version = os.getenv("OPENAI_API_VERSION")
+            openai_lib.api_version = api_version
         self.model = model
         self.temperature = temperature
 
     def invoke(self, prompt):
-        response = openai.ChatCompletion.create(
+        import openai as openai_lib
+        response = openai_lib.ChatCompletion.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=self.temperature,
             max_tokens=2000,
         )
+
         class Result:
             def __init__(self, content):
                 self.content = content
-        return Result(response.choices[0].message["content"].strip())
+
+        return Result(response.choices[0].message.content.strip())
+
+
+class GeminiClient:
+    def __init__(self, model, api_key=None, temperature=0.3):
+        if not genai:
+            raise RuntimeError("google-generativeai is not installed. Install it with: pip install google-generativeai")
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
+        # Use model parameter if provided, then env var, then default to gemini-pro
+        self.model_name = model or os.getenv("GEMINI_MODEL", "gemini-pro")
+        self.temperature = temperature
+        genai.configure(api_key=self.api_key)
+        # Try to create the model; if it fails, fallback to gemini-pro
+        try:
+            self.client = genai.GenerativeModel(self.model_name)
+        except Exception:
+            self.client = genai.GenerativeModel("gemini-pro")
+
+    def invoke(self, prompt):
+        response = self.client.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=self.temperature,
+                max_output_tokens=2000,
+            ),
+        )
+
+        class Result:
+            def __init__(self, content):
+                self.content = content
+
+        return Result(response.text.strip())
 
 
 def create_llm():
+    # Prioritize Gemini when API key is available
     if os.getenv("GEMINI_API_KEY"):
-        return OpenAIClient(
-            model=os.getenv("GEMINI_MODEL", "gemini-1.3"),
-            api_key=os.getenv("GEMINI_API_KEY"),
-            temperature=0.3,
-            api_base=os.getenv("GEMINI_API_BASE"),
-            api_type=os.getenv("GEMINI_API_TYPE"),
-            api_version=os.getenv("GEMINI_API_VERSION"),
-        )
+        try:
+            return GeminiClient(
+                model=os.getenv("GEMINI_MODEL", "gemini-pro"),
+                api_key=os.getenv("GEMINI_API_KEY"),
+                temperature=0.3,
+            )
+        except Exception as e:
+            print(f"Failed to initialize Gemini: {e}. Falling back to Groq.")
 
-    if os.getenv("OPENAI_API_KEY"):
-        return OpenAIClient(
-            model=os.getenv("OPENAI_MODEL", "openai/gpt-oss-120b"),
-            api_key=os.getenv("OPENAI_API_KEY"),
-            temperature=0.3,
-        )
-
+    # Fall back to Groq
     if os.getenv("GROQ_API_KEY"):
         preferred = os.getenv("GROQ_MODEL")
         fallback_models = [
             preferred,
-            "llama-3-4b-instant",
-            "llama-3-7b-instant",
-            "llama-3-8b-instant",
+            "llama3-8b-8192",
+            "llama3-70b-8192",
+            "mixtral-8x7b-32768",
         ]
         last_error = None
         for model in [m for m in fallback_models if m]:
@@ -127,7 +158,14 @@ def create_llm():
             f"Last error: {last_error}"
         )
 
-    raise RuntimeError("No GEMINI_API_KEY, OPENAI_API_KEY, or GROQ_API_KEY configured for the LLM.")
+    if os.getenv("OPENAI_API_KEY"):
+        return OpenAIClient(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            api_key=os.getenv("OPENAI_API_KEY"),
+            temperature=0.3,
+        )
+
+    raise RuntimeError("No GEMINI_API_KEY, GROQ_API_KEY, or OPENAI_API_KEY configured for the LLM.")
 
 llm = create_llm()
 
@@ -157,10 +195,13 @@ def safe_invoke(fn, *args, timeout=45, **kwargs):
 
 
 def push(state: ResearchState, event: str, data: dict):
-    """Push an SSE event into the stream queue."""
     q: asyncio.Queue = state["stream_queue"]
+    loop: asyncio.AbstractEventLoop = state["loop"]
     try:
-        q.put_nowait({"event": event, "data": data})
+        if loop and loop.is_running():
+            loop.call_soon_threadsafe(q.put_nowait, {"event": event, "data": data})
+        else:
+            q.put_nowait({"event": event, "data": data})
     except Exception:
         pass
 
@@ -170,12 +211,14 @@ def push(state: ResearchState, event: str, data: dict):
 # ─────────────────────────────────────────
 
 def researcher_node(state: ResearchState) -> ResearchState:
-    push(state, "agent_start", {"agent": "Researcher", "message": "Searching the web..."})
+    push(state, "agent_start", {"agent": "Researcher", "message": "Searching the web (concurrently)..."})
 
-    results = normalize_tavily_results(safe_invoke(tavily.invoke, state["query"], timeout=30))
-    competitor_results = normalize_tavily_results(
-        safe_invoke(tavily.invoke, f"{state['query']} top competitors market share 2024", timeout=30)
-    )
+    # Parallelize searches
+    f1 = executor.submit(safe_invoke, tavily.invoke, state["query"], timeout=30)
+    f2 = executor.submit(safe_invoke, tavily.invoke, f"{state['query']} top competitors market share 2024", timeout=30)
+    
+    results = normalize_tavily_results(f1.result())
+    competitor_results = normalize_tavily_results(f2.result())
 
     seen, unique = set(), []
     for r in results + competitor_results:
@@ -186,7 +229,7 @@ def researcher_node(state: ResearchState) -> ResearchState:
     state["raw_research"] = unique
 
     research_text = "\n\n".join([
-        f"Source: {r['url']}\n{r['content']}" for r in unique[:6]
+        f"Source: {r['url']}\n{r['content']}" for r in unique[:10]
     ])
 
     response = safe_invoke(llm.invoke, f"""
@@ -212,43 +255,36 @@ Data: {research_text[:3000]}
 
 
 def hitl_node(state: ResearchState) -> ResearchState:
-    """Pauses execution and waits for frontend approval via the queue."""
     push(state, "hitl_required", {
         "message": "Please review the competitor list",
         "competitors": state["competitors"],
     })
 
-    # Block until frontend sends approval back through the queue
-    q: asyncio.Queue = state["stream_queue"]
-    # We use a sentinel value put back by the /hitl-respond endpoint
-    while True:
-        try:
-            item = q.get_nowait()
-            if item.get("event") == "hitl_response":
-                choice = item["data"].get("choice", "approve")
-                if choice == "search_more":
-                    push(state, "agent_start", {"agent": "Researcher", "message": "Searching for more competitors..."})
-                    extra = normalize_tavily_results(
-                        safe_invoke(tavily.invoke, f"{state['query']} industry players market leaders analysis", timeout=30)
-                    )
-                    state["raw_research"] += extra
-                    resp = llm.invoke(
-                        f"Extract 8 competitors as JSON array from:\n{' '.join([r['content'] for r in extra[:3]])[:2000]}"
-                    )
-                    try:
-                        c = resp.content
-                        state["competitors"] = json.loads(c[c.find("["):c.rfind("]")+1])
-                    except Exception:
-                        pass
-                elif choice == "manual":
-                    state["competitors"] = item["data"].get("competitors", state["competitors"])
+    # Thread-safe block on the hitl_queue
+    hq: queue.Queue = state["hitl_queue"]
+    item = hq.get() # This blocks the background thread until hitl_respond is called
 
-                state["hitl_approved"] = True
-                push(state, "hitl_approved", {"competitors": state["competitors"]})
-                return state
+    choice = item.get("choice", "approve")
+    if choice == "search_more":
+        push(state, "agent_start", {"agent": "Researcher", "message": "Searching for more competitors..."})
+        extra = normalize_tavily_results(
+            safe_invoke(tavily.invoke, f"{state['query']} industry players market leaders analysis", timeout=30)
+        )
+        state["raw_research"] += extra
+        resp = llm.invoke(
+            f"Extract 8 competitors as JSON array from:\n{' '.join([r['content'] for r in extra[:3]])[:2000]}"
+        )
+        try:
+            c = resp.content
+            state["competitors"] = json.loads(c[c.find("["):c.rfind("]")+1])
         except Exception:
-            import time
-            time.sleep(0.3)
+            pass
+    elif choice == "manual":
+        state["competitors"] = item.get("competitors", state["competitors"])
+
+    state["hitl_approved"] = True
+    push(state, "hitl_approved", {"competitors": state["competitors"]})
+    return state
 
 
 def analyst_node(state: ResearchState) -> ResearchState:
@@ -377,8 +413,8 @@ class HITLResponse(BaseModel):
     competitors: list[str] = []
 
 
-# In-memory session store (use Redis in production)
-sessions: dict[str, asyncio.Queue] = {}
+# In-memory session store: {session_id: {"stream_queue": asyncio.Queue, "hitl_queue": queue.Queue}}
+sessions: dict[str, dict] = {}
 
 
 # ─────────────────────────────────────────
@@ -395,7 +431,8 @@ async def research_stream(req: ResearchRequest):
 
     session_id = str(uuid.uuid4())
     q: asyncio.Queue = asyncio.Queue()
-    sessions[session_id] = q
+    hq: queue.Queue = queue.Queue()
+    sessions[session_id] = {"stream_queue": q, "hitl_queue": hq}
 
     # Send session_id as first event so frontend can store it for HITL
     await q.put({"event": "session_start", "data": {"session_id": session_id}})
@@ -412,6 +449,8 @@ async def research_stream(req: ResearchRequest):
         "revision_count": 0,
         "messages": [],
         "stream_queue": q,
+        "hitl_queue": hq,
+        "loop": asyncio.get_running_loop(),
     }
 
     def run_graph():
@@ -432,7 +471,10 @@ async def research_stream(req: ResearchRequest):
     async def event_generator() -> AsyncIterator[str]:
         while True:
             try:
-                item = await asyncio.wait_for(q.get(), timeout=180.0)
+                # Get the queue from the session data
+                sq = sessions.get(session_id, {}).get("stream_queue")
+                if not sq: break
+                item = await asyncio.wait_for(sq.get(), timeout=180.0)
                 yield f"event: {item['event']}\ndata: {json.dumps(item['data'])}\n\n"
                 if item["event"] in ("done", "error"):
                     break
@@ -452,14 +494,12 @@ async def research_stream(req: ResearchRequest):
 @app.post("/research/hitl-respond")
 async def hitl_respond(resp: HITLResponse):
     """Frontend calls this to send the HITL approval back to the running graph."""
-    q = sessions.get(resp.session_id)
-    if not q:
+    sess = sessions.get(resp.session_id)
+    if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    await q.put({
-        "event": "hitl_response",
-        "data": {"choice": resp.choice, "competitors": resp.competitors}
-    })
+    hq: queue.Queue = sess["hitl_queue"]
+    hq.put({"choice": resp.choice, "competitors": resp.competitors})
     return {"status": "ok"}
 
 

@@ -29,15 +29,63 @@ class ResearchState(TypedDict):
     messages: list[str]               # event log shown to frontend
 
 
-# ─────────────────────────────────────────
-# 2. TOOLS & LLM
-# ─────────────────────────────────────────
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
-llm = ChatGroq(
-    model="llama-3.1-8b-instant",
-    api_key=os.getenv("GROQ_API_KEY"),
-    temperature=0.3,
-)
+# ... existing code ...
+
+class GeminiClient:
+    def __init__(self, model, api_key=None, temperature=0.3):
+        if not genai:
+            raise RuntimeError("google-generativeai is not installed. Install it with: pip install google-generativeai")
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
+        self.model_name = model or os.getenv("GEMINI_MODEL", "gemini-pro")
+        self.temperature = temperature
+        genai.configure(api_key=self.api_key)
+        try:
+            self.client = genai.GenerativeModel(self.model_name)
+        except Exception:
+            self.client = genai.GenerativeModel("gemini-pro")
+
+    def invoke(self, prompt):
+        response = self.client.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=self.temperature,
+                max_output_tokens=2000,
+            ),
+        )
+
+        class Result:
+            def __init__(self, content):
+                self.content = content
+
+        return Result(response.text.strip())
+
+
+def create_llm():
+    if os.getenv("GEMINI_API_KEY"):
+        try:
+            return GeminiClient(
+                model=os.getenv("GEMINI_MODEL", "gemini-pro"),
+                api_key=os.getenv("GEMINI_API_KEY"),
+                temperature=0.3,
+            )
+        except Exception as e:
+            print(f"Failed to initialize Gemini: {e}. Falling back to Groq.")
+
+    if os.getenv("GROQ_API_KEY"):
+        return ChatGroq(
+            model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+            api_key=os.getenv("GROQ_API_KEY"),
+            temperature=0.3,
+        )
+
+    raise RuntimeError("No LLM API keys found in .env.")
+
+llm = create_llm()
 
 tavily = TavilySearchResults(
     max_results=5,
