@@ -1,11 +1,10 @@
-fastapi==0.115.0
-uvicorn==0.30.6
-python-dotenv==1.0.1
-openai
+fastapi
+uvicorn
+pydantic
+python-dotenv
+aiofiles
 google-generativeai
 langchain-groq
-langchain-community
+langchain-tavily
 langgraph
 tavily-python
-pydantic
-aiofiles
