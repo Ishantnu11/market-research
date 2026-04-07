@@ -8,3 +8,5 @@ langchain-groq
 langchain-tavily
 langgraph
 tavily-python
+openai
+typing-extensions
