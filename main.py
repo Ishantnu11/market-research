@@ -136,16 +136,13 @@ class MultiProviderClient:
         try:
             return self.primary.invoke(prompt)
         except Exception as e:
-            error_msg = str(e)
-            # Check for common capacity/overload errors
-            if "503" in error_msg or "too many requests" in error_msg.lower() or "overloaded" in error_msg.lower():
-                print(f"Primary provider failed (503/Overload): {error_msg}")
-                if self.fallback:
-                    print("Falling back to secondary provider...")
-                    try:
-                        return self.fallback.invoke(prompt)
-                    except Exception as fallback_e:
-                        raise RuntimeError(f"Both primary and fallback providers failed. Primary: {e}, Fallback: {fallback_e}")
+            print(f"Provider failed: {e}")
+            if self.fallback:
+                print("Falling back to next provider...")
+                try:
+                    return self.fallback.invoke(prompt)
+                except Exception as fallback_e:
+                    raise RuntimeError(f"Fallback chain exhausted.\nPrevious: {e}\nFinal: {fallback_e}")
             raise e
 
 def create_llm():
