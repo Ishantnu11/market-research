@@ -127,50 +127,78 @@ class GeminiClient:
         return Result(response.text.strip())
 
 
+class MultiProviderClient:
+    def __init__(self, primary, fallback=None):
+        self.primary = primary
+        self.fallback = fallback
+
+    def invoke(self, prompt):
+        try:
+            return self.primary.invoke(prompt)
+        except Exception as e:
+            error_msg = str(e)
+            # Check for common capacity/overload errors
+            if "503" in error_msg or "too many requests" in error_msg.lower() or "overloaded" in error_msg.lower():
+                print(f"Primary provider failed (503/Overload): {error_msg}")
+                if self.fallback:
+                    print("Falling back to secondary provider...")
+                    try:
+                        return self.fallback.invoke(prompt)
+                    except Exception as fallback_e:
+                        raise RuntimeError(f"Both primary and fallback providers failed. Primary: {e}, Fallback: {fallback_e}")
+            raise e
+
 def create_llm():
-    # Prioritize Gemini when API key is available
+    gemini_client = None
     if os.getenv("GEMINI_API_KEY"):
         try:
-            return GeminiClient(
-                model=os.getenv("GEMINI_MODEL", "gemini-pro"),
+            gemini_client = GeminiClient(
+                model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
                 api_key=os.getenv("GEMINI_API_KEY"),
                 temperature=0.3,
             )
         except Exception as e:
-            print(f"Failed to initialize Gemini: {e}. Falling back to Groq.")
+            print(f"Failed to initialize Gemini: {e}")
 
-    # Fall back to Groq
+    groq_client = None
     if os.getenv("GROQ_API_KEY"):
         preferred = os.getenv("GROQ_MODEL")
-        fallback_models = [
-            preferred,
-            "llama3-8b-8192",
-            "llama3-70b-8192",
-            "mixtral-8x7b-32768",
-        ]
-        last_error = None
+        fallback_models = [preferred, "llama3-70b-8192", "mixtral-8x7b-32768"]
         for model in [m for m in fallback_models if m]:
             try:
-                return ChatGroq(
+                groq_client = ChatGroq(
                     model=model,
                     api_key=os.getenv("GROQ_API_KEY"),
                     temperature=0.3,
                 )
-            except Exception as e:
-                last_error = e
-        raise RuntimeError(
-            f"Unable to initialize ChatGroq. Tried models: {[m for m in fallback_models if m]}. "
-            f"Last error: {last_error}"
-        )
+                break
+            except Exception:
+                continue
 
+    openai_client = None
     if os.getenv("OPENAI_API_KEY"):
-        return OpenAIClient(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            api_key=os.getenv("OPENAI_API_KEY"),
-            temperature=0.3,
-        )
+        try:
+            openai_client = OpenAIClient(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                api_key=os.getenv("OPENAI_API_KEY"),
+                temperature=0.3,
+            )
+        except Exception:
+            pass
 
-    raise RuntimeError("No GEMINI_API_KEY, GROQ_API_KEY, or OPENAI_API_KEY configured for the LLM.")
+    # Build the chain of providers (Gemini -> OpenAI -> Groq)
+    if gemini_client:
+        if openai_client and groq_client:
+            fallback_chain = MultiProviderClient(primary=openai_client, fallback=groq_client)
+        else:
+            fallback_chain = openai_client or groq_client
+        return MultiProviderClient(primary=gemini_client, fallback=fallback_chain)
+    elif openai_client:
+        return MultiProviderClient(primary=openai_client, fallback=groq_client)
+    elif groq_client:
+        return groq_client
+
+    raise RuntimeError("No LLM providers (Gemini, Groq, or OpenAI) are configured correctly.")
 
 llm = create_llm()
 
